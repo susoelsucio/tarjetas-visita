@@ -107,9 +107,10 @@
       <label for="apiKey">Clave API de Gemini</label>
       <input type="password" id="apiKey" autocomplete="off" placeholder="Pega aquí tu clave">
       <p class="hint">Se guarda solo en este móvil, en este navegador. No se envía a ningún sitio salvo a Google.</p>
-      <label for="model">Modelo</label>
-      <input type="text" id="model" autocomplete="off">
-      <p class="hint">Déjalo como está. Solo cámbialo si deja de funcionar.</p>
+      <label for="modelSel">Modelo</label>
+      <select id="modelSel"></select>
+      <input type="text" id="model" autocomplete="off" placeholder="Escribe el nombre del modelo" hidden style="margin-top:8px">
+      <p class="hint">Si el modelo elegido falla (saturado, límite o no existe), la página prueba sola con los otros.</p>
       <div class="save-row"><button id="btnSaveSettings">Guardar ajustes</button></div>
     </div>
   </details>
@@ -117,11 +118,17 @@
 
 <script>
 const DEFAULT_MODEL = "gemini-flash-latest";
+const MODELS = [
+  ["gemini-flash-latest", "Flash, el más reciente (automático)"],
+  ["gemini-flash-lite-latest", "Flash-Lite, más ligero (automático)"],
+  ["gemini-3.5-flash", "Gemini 3.5 Flash"],
+  ["gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite"]
+];
 
 const PROMPT =
   "Eres un extractor de datos de tarjetas de visita. Analiza la imagen y extrae los datos de cada tarjeta que aparezca. " +
   "Si una tarjeta tiene texto en varios idiomas, usa el idioma principal. Respeta mayúsculas y acentos tal como aparecen. " +
-  "Separa nombre y apellidos. Escribe los teléfonos con prefijo internacional si aparece; si no aparece y el número es español, no lo añadas. " +
+  "Separa nombre y apellidos. Si la tarjeta es solo de una empresa y no aparece ninguna persona, pon el nombre de la empresa en company y también en first_name, y deja last_name vacío. Si aparece una persona y una empresa, la persona va en first_name y last_name, y la empresa solo en company. Escribe los teléfonos con prefijo internacional si aparece; si no aparece y el número es español, no lo añadas. " +
   "Si un dato no aparece, déjalo vacío. No inventes nada.";
 
 const SCHEMA = {
@@ -160,11 +167,19 @@ function setStatus(msg, kind, spinner) {
 
 /* ---------- Ajustes ---------- */
 $("apiKey").value = store.get("gemini_key");
-$("model").value = store.get("gemini_model") || DEFAULT_MODEL;
+(function initModel() {
+  const sel = $("modelSel");
+  MODELS.forEach(([v, t]) => sel.appendChild(new Option(t, v)));
+  sel.appendChild(new Option("Otro (escribir nombre)…", "__custom"));
+  const saved = store.get("gemini_model") || DEFAULT_MODEL;
+  if (MODELS.some(m => m[0] === saved)) sel.value = saved;
+  else { sel.value = "__custom"; $("model").value = saved; $("model").hidden = false; }
+  sel.onchange = () => { $("model").hidden = sel.value !== "__custom"; };
+})();
 if (!store.get("gemini_key")) $("settings").open = true;
 $("btnSaveSettings").onclick = () => {
   store.set("gemini_key", $("apiKey").value.trim());
-  store.set("gemini_model", $("model").value.trim() || DEFAULT_MODEL);
+  store.set("gemini_model", $("modelSel").value === "__custom" ? ($("model").value.trim() || DEFAULT_MODEL) : $("modelSel").value);
   $("settings").open = false;
   setStatus("Ajustes guardados.", "ok");
 };
@@ -220,11 +235,12 @@ async function handleFiles(fileList, input) {
 }
 
 /* ---------- Llamada a Gemini ---------- */
-async function askGemini(base64, key, model) {
+async function callGemini(base64, key, model) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const fail = (msg, retry) => { const e = new Error(msg); e.retry = retry; return e; };
   let res;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 45000);
+  const timer = setTimeout(() => ctrl.abort(), 35000);
   try {
     res = await fetch(url, {
       method: "POST",
@@ -237,18 +253,19 @@ async function askGemini(base64, key, model) {
     });
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error("Gemini no responde (45 s). Prueba otro modelo en Ajustes, por ejemplo gemini-2.5-flash.");
-    throw new Error("No se pudo conectar con Gemini (" + (e.message || "error de red") + "). Comprueba tu internet o la clave.");
+    if (e.name === "AbortError") throw fail(`${model} no responde.`, true);
+    throw fail("No se pudo conectar con Gemini. Comprueba tu internet o la clave.", false);
   }
   clearTimeout(timer);
   if (!res.ok) {
     let detail = "";
     try { detail = (await res.json()).error.message; } catch (e) {}
-    if (res.status === 400 && /API key/i.test(detail)) throw new Error("La clave API no es válida. Revísala en Ajustes.");
-    if (res.status === 403) throw new Error("Gemini rechazó la clave (403). Revísala en Ajustes.");
-    if (res.status === 404) throw new Error("El modelo no existe. Cámbialo en Ajustes por gemini-flash-latest.");
-    if (res.status === 429) throw new Error("Has llegado al límite gratuito. Espera un minuto e inténtalo otra vez.");
-    throw new Error(`Error de Gemini (${res.status}). ${detail}`.trim());
+    if (res.status === 400 && /API key/i.test(detail)) throw fail("La clave API no es válida. Revísala en Ajustes.", false);
+    if (res.status === 403) throw fail("Gemini rechazó la clave (403). Revísala en Ajustes.", false);
+    if (res.status === 404) throw fail(`El modelo ${model} no existe.`, true);
+    if (res.status === 429) throw fail(`${model} ha llegado al límite gratuito.`, true);
+    if (res.status === 503 || res.status === 500) throw fail(`${model} está saturado.`, true);
+    throw fail(`Error de Gemini (${res.status}). ${detail}`.trim(), false);
   }
   const data = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
@@ -256,8 +273,23 @@ async function askGemini(base64, key, model) {
     const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch (e) {
-    throw new Error("No he podido interpretar la respuesta. Prueba con otra foto, más nítida.");
+    throw fail("No he podido interpretar la respuesta. Prueba con otra foto, más nítida.", false);
   }
+}
+
+async function askGemini(base64, key, model) {
+  const chain = [model, ...MODELS.map(m => m[0]).filter(m => m !== model)].slice(0, 3);
+  let last;
+  for (let n = 0; n < chain.length; n++) {
+    try {
+      if (n > 0) setStatus(`${last.message} Probando con ${chain[n]}…`, "", true);
+      return await callGemini(base64, key, chain[n]);
+    } catch (e) {
+      last = e;
+      if (!e.retry) throw e;
+    }
+  }
+  throw new Error(`${last.message} Ningún modelo ha respondido; inténtalo en unos minutos.`);
 }
 
 /* ---------- Formulario editable ---------- */
@@ -288,6 +320,7 @@ function phoneRow(p) {
 }
 
 function renderContact(c, thumbUrl) {
+  if (!c.first_name && !c.last_name && c.company) c.first_name = c.company;
   const card = el("section", { class: "card" });
   card.appendChild(el("h2", { text: [c.first_name, c.last_name].filter(Boolean).join(" ") || "Contacto" }));
   const th = el("img", { class: "thumb", alt: "Foto de la tarjeta" }); th.src = thumbUrl; card.appendChild(th);
