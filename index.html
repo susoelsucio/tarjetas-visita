@@ -216,21 +216,25 @@ async function handleFiles(fileList, input) {
   if (!key) { $("settings").open = true; setStatus("Primero pega tu clave de Gemini en Ajustes.", "err"); return; }
   const model = store.get("gemini_model") || DEFAULT_MODEL;
   $("btnCam").disabled = $("btnGal").disabled = true;
-  let done = 0, added = 0;
-  for (const f of files) {
-    setStatus(`Leyendo tarjeta ${done + 1} de ${files.length}…`, "", true);
+  let added = 0;
+  const failed = [];
+  for (let n = 0; n < files.length; n++) {
+    setStatus(`Leyendo tarjeta ${n + 1} de ${files.length}…`, "", true);
     try {
-      const img = await resizeToJpeg(f);
+      const img = await resizeToJpeg(files[n]);
       const contacts = await askGemini(img.base64, key, model);
       contacts.forEach(c => { renderContact(c, img.dataUrl); added++; });
     } catch (err) {
-      setStatus(err.message, "err");
-      $("btnCam").disabled = $("btnGal").disabled = false;
-      return;
+      failed.push({ n: n + 1, msg: err.message });
     }
-    done++;
   }
   $("btnCam").disabled = $("btnGal").disabled = false;
+  if (failed.length && files.length === 1) { setStatus(failed[0].msg, "err"); return; }
+  if (failed.length) {
+    const list = failed.map(f => `foto ${f.n}`).join(", ");
+    setStatus(`${added} contacto(s) leídos. No se pudo leer: ${list}. Motivo: ${failed[failed.length - 1].msg}`, "err");
+    return;
+  }
   setStatus(added ? "Revisa los datos y pulsa Descargar contacto." : "No he encontrado ninguna tarjeta en la imagen.", added ? "ok" : "err");
 }
 
@@ -248,7 +252,7 @@ async function callGemini(base64, key, model) {
       headers: { "Content-Type": "application/json", "x-goog-api-key": key },
       body: JSON.stringify({
         contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: base64 } }] }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: SCHEMA, temperature: 0 }
+        generationConfig: { responseMimeType: "application/json", responseSchema: SCHEMA }
       })
     });
   } catch (e) {
@@ -322,11 +326,14 @@ function phoneRow(p) {
 function renderContact(c, thumbUrl) {
   if (!c.first_name && !c.last_name && c.company) c.first_name = c.company;
   const card = el("section", { class: "card" });
-  card.appendChild(el("h2", { text: [c.first_name, c.last_name].filter(Boolean).join(" ") || "Contacto" }));
+  const h2 = el("h2", { text: [c.first_name, c.last_name].filter(Boolean).join(" ") || "Contacto" });
+  card.appendChild(h2);
   const th = el("img", { class: "thumb", alt: "Foto de la tarjeta" }); th.src = thumbUrl; card.appendChild(th);
 
   const first = textInput(c.first_name), last = textInput(c.last_name);
   const f1 = field("Nombre", first), f2 = field("Apellidos", last);
+  const retitle = () => { h2.textContent = [first.value.trim(), last.value.trim()].filter(Boolean).join(" ") || "Contacto"; };
+  first.addEventListener("input", retitle); last.addEventListener("input", retitle);
   card.appendChild(el("div", { class: "row2" }, [el("div", {}, f1), el("div", {}, f2)]));
 
   const title = textInput(c.job_title), org = textInput(c.company);
@@ -354,13 +361,10 @@ function renderContact(c, thumbUrl) {
 
   const dl = el("button", { text: "Descargar contacto" });
   dl.onclick = () => { const d = read(); downloadVcf(buildVcf(d), fileName(d)); };
-  const share = el("button", { class: "alt", text: "Compartir…" });
-  share.onclick = () => shareVcf(read());
   const rm = el("button", { class: "quiet", text: "Descartar" });
   rm.onclick = () => card.remove();
 
   const saveRow = el("div", { class: "save-row" }, [dl]);
-  if (navigator.canShare) saveRow.appendChild(share);
   saveRow.appendChild(rm);
   card.appendChild(saveRow);
   $("results").prepend(card);
@@ -376,7 +380,7 @@ function buildVcf(d) {
   if (d.org) L.push(`ORG:${esc(d.org)}`);
   if (d.title) L.push(`TITLE:${esc(d.title)}`);
   d.phones.forEach(p => {
-    const t = p.type === "OTHER" ? "VOICE" : p.type;
+    const t = { CELL: "CELL", WORK: "WORK,VOICE", FAX: "WORK,FAX", OTHER: "VOICE" }[p.type] || "VOICE";
     L.push(`TEL;TYPE=${t}:${p.number.replace(/[^\d+*#() \-.]/g, "")}`);
   });
   d.emails.forEach(e => L.push(`EMAIL;TYPE=INTERNET,WORK:${e}`));
@@ -396,13 +400,6 @@ function downloadVcf(text, name) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   setStatus("Descargado. Abre el archivo desde la notificación o desde Descargas para importarlo en Contactos.", "ok");
-}
-async function shareVcf(d) {
-  const file = new File([buildVcf(d)], fileName(d), { type: "text/vcard" });
-  try {
-    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
-    else downloadVcf(buildVcf(d), fileName(d));
-  } catch (e) { /* cancelado por el usuario */ }
 }
 
 </script>
